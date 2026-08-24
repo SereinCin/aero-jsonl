@@ -5,9 +5,8 @@ Native **JSON Lines (JSONL / NDJSON)** processing for Python, written in
 projects every line of a `.jsonl` / `.ndjson` log — no pandas, no Polars, no
 SQL, no Python object round-trip for the hot path.
 
-```bash
-pip install aero-jsonl
-```
+> **Status:** v0.1 source release. The package will land on PyPI once platform
+> wheels are built; for now install from source (see [Build](#build)).
 
 ```python
 import aero_jsonl
