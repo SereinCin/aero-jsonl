@@ -1,0 +1,16 @@
+# compiled artifacts
+src/kernel.pyd
+src/kernel.so
+src/kernel.dylib
+aero_jsonl/kernel.pyd
+aero_jsonl/kernel.so
+aero_jsonl/kernel.dylib
+__pycache__/
+*.pyc
+*.aero-cache
+build/
+dist/
+*.egg-info/
+bench/data_*.jsonl
+bench/out_*.jsonl
+bench/*.out

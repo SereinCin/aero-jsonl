@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aero-jsonl"
+version = "0.1.0"
+description = "Native JSONL / JSON Lines processing for Python (Aero-compiled kernel)"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+keywords = ["jsonl", "ndjson", "json", "jmespath", "streaming", "fast"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Text Processing :: Markup :: JSON",
+]
+
+[project.scripts]
+aero-jsonl = "aero_jsonl.cli:main"
+
+[tool.setuptools]
+packages = ["aero_jsonl"]
+
+[tool.setuptools.package-data]
+aero_jsonl = ["*.pyd", "*.so", "*.dylib"]

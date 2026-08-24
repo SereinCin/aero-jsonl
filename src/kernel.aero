@@ -1,0 +1,2231 @@
+// aero-jmespath kernel v0.2: JSON parser + serializer over a flat value vals.
+//
+// Every JSON value lives in a single `Vec<Jv>` vals; arrays/objects store
+// vals indices. An object is a flat `Vec<i64>` of `[key_index, value_index, ...]`
+// pairs (key_index points to a string value in the vals), preserving key names.
+//
+// Numbers are stored as i64 in fixed-point micro-units (value * 1e6). Aero has no
+// i64->f64 conversion and extern "C" cannot return f64, so a 1e6 fixed point is the
+// portable way to do numeric compare + serialize without floats. All compliance
+// numbers are short decimals, well within i64 range.
+//
+// Built with `aero build src/kernel.aero --pyext` -> kernel.pyd / kernel.so.
+
+enum Jv {
+    Null,
+    B(bool),
+    N(i64),           // number: value * 1e6 (fixed point)
+    S(str),           // NUL-terminated string buffer (vals-owned, leaked deliberately)
+    A(Vec<i64>),      // array: vals indices
+    O(Vec<i64>),      // object: [key_idx, val_idx, ...]
+}
+
+fn ws_skip(data: str, n: i64, pos: &mut i64) {
+    while (*pos < n) {
+        let c = data[*pos];
+        if ((c == 32) || (c == 9) || (c == 10) || (c == 13)) {
+            *pos = *pos + 1;
+        } else {
+            break;
+        }
+    }
+}
+
+fn hex_val(c: i64) -> i64 {
+    if ((c >= 48) && (c <= 57)) { return c - 48; }
+    if ((c >= 65) && (c <= 70)) { return c - 55; }
+    if ((c >= 97) && (c <= 102)) { return c - 87; }
+    return 0;
+}
+
+// Read a `\uXXXX` escape (caller has consumed the `\u`) and return the code point.
+fn read_hex4(data: str, pos: i64) -> i64 {
+    let h0 = hex_val(data[pos]);
+    let h1 = hex_val(data[pos + 1]);
+    let h2 = hex_val(data[pos + 2]);
+    let h3 = hex_val(data[pos + 3]);
+    return h0 * 4096 + h1 * 256 + h2 * 16 + h3;
+}
+
+// Append code point `cp` as UTF-8 into an owned String and return it (String is
+// a move type; &mut String receivers can't call String methods in Aero).
+fn utf8_push_std(sb: String, cp: i64) -> String {
+    if (cp < 128) {
+        sb.push(cp);
+    } else if (cp < 2048) {
+        sb.push(192 + (cp / 64));
+        sb.push(128 + (cp % 64));
+    } else if (cp < 65536) {
+        sb.push(224 + (cp / 4096));
+        sb.push(128 + ((cp / 64) % 64));
+        sb.push(128 + (cp % 64));
+    } else {
+        sb.push(240 + (cp / 262144));
+        sb.push(128 + ((cp / 4096) % 64));
+        sb.push(128 + ((cp / 64) % 64));
+        sb.push(128 + (cp % 64));
+    }
+    return sb;
+}
+
+fn parse_string(data: str, n: i64, pos: &mut i64, vals: &mut Vec<Jv>, err: &mut i64) -> i64 {
+    *pos = *pos + 1; // consume opening quote
+    let mut sb: String = String::with_cap(8);
+    let esc = 0;
+    let closed = 0;
+    while (*pos < n) {
+        let c = data[*pos];
+        if (esc == 1) {
+            if (c == 34) { sb.push(34); *pos = *pos + 1; }
+            else if (c == 92) { sb.push(92); *pos = *pos + 1; }
+            else if (c == 47) { sb.push(47); *pos = *pos + 1; }
+            else if (c == 98) { sb.push(8); *pos = *pos + 1; }
+            else if (c == 102) { sb.push(12); *pos = *pos + 1; }
+            else if (c == 110) { sb.push(10); *pos = *pos + 1; }
+            else if (c == 114) { sb.push(13); *pos = *pos + 1; }
+            else if (c == 116) { sb.push(9); *pos = *pos + 1; }
+            else if (c == 117) {
+                // \uXXXX with optional surrogate pair
+                let cp = read_hex4(data, *pos + 1);
+                if ((cp >= 55296) && (cp <= 56319)) {
+                    // high surrogate: expect a following \uXXXX low surrogate
+                    if ((*pos + 7 < n) && (data[*pos + 5] == 92) && (data[*pos + 6] == 117)) {
+                        let lo = read_hex4(data, *pos + 7);
+                        let combined = 65536 + (cp - 55296) * 1024 + (lo - 56320);
+                        sb = utf8_push_std(sb, combined);
+                        *pos = *pos + 11;
+                    } else {
+                        // lone high surrogate: emit as-is (best effort)
+                        sb = utf8_push_std(sb, cp);
+                        *pos = *pos + 5;
+                    }
+                } else {
+                    sb = utf8_push_std(sb, cp);
+                    *pos = *pos + 5;
+                }
+            } else {
+                sb.push(c);
+                *pos = *pos + 1;
+            }
+            esc = 0;
+        } else if (c == 92) {
+            esc = 1;
+            *pos = *pos + 1;
+        } else if (c == 34) {
+            *pos = *pos + 1;
+            closed = 1;
+            break;
+        } else {
+            sb.push(c);
+            *pos = *pos + 1;
+        }
+    }
+    if (closed == 0) {
+        *err = 1;
+    }
+    let s = sb.data();
+    vals.push(Jv::S(s));
+    return vals.len() - 1;
+}
+
+fn pow10(k: i64) -> i64 {
+    let mut r: i64 = 1;
+    let mut i: i64 = 0;
+    while (i < k) {
+        r = r * 10;
+        i = i + 1;
+    }
+    return r;
+}
+
+// Parse the JSON number token data[start..end] into fixed-point micros
+// (value * 1e6). Reads bytes directly with known bounds; no strlen/substr.
+fn parse_fixed_range(data: str, start: i64, end: i64) -> i64 {
+    let mut i = start;
+    let mut neg = 0;
+    if ((i < end) && (data[i] == 45)) {
+        neg = 1;
+        i = i + 1;
+    }
+    let int_start = i;
+    while ((i < end) && (data[i] >= 48) && (data[i] <= 57)) {
+        i = i + 1;
+    }
+    let int_end = i;
+    let mut frac_digits: i64 = 0;
+    let mut frac_start: i64 = -1;
+    if ((i < end) && (data[i] == 46)) {
+        i = i + 1;
+        frac_start = i;
+        while ((i < end) && (data[i] >= 48) && (data[i] <= 57)) {
+            i = i + 1;
+        }
+        frac_digits = i - frac_start;
+    }
+    let mut exp: i64 = 0;
+    if ((i < end) && ((data[i] == 101) || (data[i] == 69))) {
+        i = i + 1;
+        let mut eneg = 0;
+        if ((i < end) && (data[i] == 45)) {
+            eneg = 1;
+            i = i + 1;
+        } else if ((i < end) && (data[i] == 43)) {
+            i = i + 1;
+        }
+        let mut e: i64 = 0;
+        while ((i < end) && (data[i] >= 48) && (data[i] <= 57)) {
+            e = e * 10 + (data[i] - 48);
+            i = i + 1;
+        }
+        if (eneg == 1) {
+            exp = 0 - e;
+        } else {
+            exp = e;
+        }
+    }
+    let mut ip: i64 = 0;
+    let mut k = int_start;
+    while (k < int_end) {
+        ip = ip * 10 + (data[k] - 48);
+        k = k + 1;
+    }
+    let mut mantissa = ip;
+    if (frac_start >= 0) {
+        let mut fp: i64 = 0;
+        let mut k2 = frac_start;
+        while (k2 < frac_start + frac_digits) {
+            fp = fp * 10 + (data[k2] - 48);
+            k2 = k2 + 1;
+        }
+        mantissa = ip * pow10(frac_digits) + fp;
+    }
+    let scale = 6 - frac_digits + exp;
+    let mut value: i64 = 0;
+    if (scale >= 0) {
+        value = mantissa * pow10(scale);
+    } else {
+        value = mantissa / pow10(0 - scale);
+    }
+    if (neg == 1) {
+        value = 0 - value;
+    }
+    return value;
+}
+
+fn parse_number(data: str, n: i64, pos: &mut i64, vals: &mut Vec<Jv>) -> i64 {
+    let start = *pos;
+    while (*pos < n) {
+        let c = data[*pos];
+        if ((c >= 48) && (c <= 57)) {
+            *pos = *pos + 1;
+        } else if ((c == 46) || (c == 101) || (c == 69) || (c == 45) || (c == 43)) {
+            *pos = *pos + 1;
+        } else {
+            break;
+        }
+    }
+    let v = parse_fixed_range(data, start, *pos);
+    vals.push(Jv::N(v));
+    return vals.len() - 1;
+}
+
+fn parse_value(data: str, n: i64, pos: &mut i64, vals: &mut Vec<Jv>, err: &mut i64) -> i64 {
+    ws_skip(data, n, pos);
+    let c = data[*pos];
+    if (c == 123) { return parse_object(data, n, pos, vals, err); }
+    if (c == 91) { return parse_array(data, n, pos, vals, err); }
+    if (c == 34) { return parse_string(data, n, pos, vals, err); }
+    if (c == 116) { *pos = *pos + 4; vals.push(Jv::B(true)); return vals.len() - 1; }
+    if (c == 102) { *pos = *pos + 5; vals.push(Jv::B(false)); return vals.len() - 1; }
+    if (c == 110) { *pos = *pos + 4; vals.push(Jv::Null); return vals.len() - 1; }
+    let num_start = ((c >= 48) && (c <= 57)) || (c == 45);
+    if (b2i(num_start) == 0) {
+        *err = 1;
+        return 0;
+    }
+    return parse_number(data, n, pos, vals);
+}
+
+fn parse_array(data: str, n: i64, pos: &mut i64, vals: &mut Vec<Jv>, err: &mut i64) -> i64 {
+    *pos = *pos + 1;
+    let items: Vec<i64> = Vec::with_cap(8);
+    let closed = 0;
+    ws_skip(data, n, pos);
+    if (data[*pos] == 93) {
+        *pos = *pos + 1;
+        vals.push(Jv::A(items));
+        return vals.len() - 1;
+    }
+    while (*pos < n) {
+        let vi = parse_value(data, n, pos, vals, err);
+        if (*err != 0) { return 0; }
+        items.push(vi);
+        ws_skip(data, n, pos);
+        if (data[*pos] == 44) {
+            *pos = *pos + 1;
+        } else if (data[*pos] == 93) {
+            *pos = *pos + 1;
+            closed = 1;
+            break;
+        } else {
+            *err = 1;
+            break;
+        }
+    }
+    if (closed == 0) {
+        *err = 1;
+    }
+    vals.push(Jv::A(items));
+    return vals.len() - 1;
+}
+
+fn parse_object(data: str, n: i64, pos: &mut i64, vals: &mut Vec<Jv>, err: &mut i64) -> i64 {
+    *pos = *pos + 1;
+    let pairs: Vec<i64> = Vec::with_cap(16);
+    ws_skip(data, n, pos);
+    if (data[*pos] == 125) {
+        *pos = *pos + 1;
+        vals.push(Jv::O(pairs));
+        return vals.len() - 1;
+    }
+    while (*pos < n) {
+        ws_skip(data, n, pos);
+        // JSON object keys must be quoted strings.
+        if (data[*pos] != 34) {
+            *err = 1;
+            return 0;
+        }
+        let ki = parse_string(data, n, pos, vals, err);
+        if (*err != 0) { return 0; }
+        ws_skip(data, n, pos);
+        if (data[*pos] == 58) {
+            *pos = *pos + 1;
+        } else {
+            *err = 1;
+            return 0;
+        }
+        let vi = parse_value(data, n, pos, vals, err);
+        if (*err != 0) { return 0; }
+        pairs.push(ki);
+        pairs.push(vi);
+        ws_skip(data, n, pos);
+        if (data[*pos] == 44) {
+            *pos = *pos + 1;
+        } else if (data[*pos] == 125) {
+            *pos = *pos + 1;
+            break;
+        } else {
+            *err = 1;
+            break;
+        }
+    }
+    vals.push(Jv::O(pairs));
+    return vals.len() - 1;
+}
+
+// ---- value helpers ----
+
+fn as_str(v: Jv) -> str {
+    match (v) {
+        S(s) => { return s; }
+        _ => { return ""; }
+    }
+}
+
+fn as_arr(v: Jv) -> Vec<i64> {
+    match (v) {
+        A(a) => { return a; }
+        _ => { let e: Vec<i64> = Vec::new(); return e; }
+    }
+}
+
+fn as_obj(v: Jv) -> Vec<i64> {
+    match (v) {
+        O(o) => { return o; }
+        _ => { let e: Vec<i64> = Vec::new(); return e; }
+    }
+}
+
+fn as_num(v: Jv) -> i64 {
+    match (v) {
+        N(x) => { return x; }
+        _ => { return 0; }
+    }
+}
+
+fn as_bool(v: Jv) -> bool {
+    match (v) {
+        B(x) => { return x; }
+        _ => { return false; }
+    }
+}
+
+// bool -> 0/1 so we can compare booleans with numeric `==`.
+fn b2i(x: bool) -> i64 {
+    if (x) { return 1; }
+    return 0;
+}
+
+// ---- serializer ----
+
+// Append a NUL-terminated `str` to the byte output buffer.
+fn push_s(buf: &mut Vec<i64>, s: str) {
+    let n = len(s);
+    let i = 0;
+    while (i < n) {
+        buf.push(s[i]);
+        i = i + 1;
+    }
+}
+
+// Copy a byte buffer into a fresh String and return its NUL-terminated data
+// pointer (the String is intentionally leaked; the buffer outlives the call).
+fn bytes_to_str(buf: &mut Vec<i64>) -> str {
+    let sb = String::new();
+    let n = buf.len();
+    let i = 0;
+    while (i < n) {
+        sb.push(buf.get(i));
+        i = i + 1;
+    }
+    return sb.data();
+}
+
+// Copy a byte buffer into an owned String.
+fn bytes_to_string(buf: &mut Vec<i64>) -> String {
+    let sb = String::new();
+    let n = buf.len();
+    let i = 0;
+    while (i < n) {
+        sb.push(buf.get(i));
+        i = i + 1;
+    }
+    return sb;
+}
+
+fn ser_string_raw(s: str, out: &mut Vec<i64>) {
+    out.push(34);
+    let n = len(s);
+    let i = 0;
+    while (i < n) {
+        let c = s[i];
+        if (c == 34) { push_s(out, "\\\""); }
+        else if (c == 92) { push_s(out, "\\\\"); }
+        else if (c == 10) { push_s(out, "\\n"); }
+        else if (c == 13) { push_s(out, "\\r"); }
+        else if (c == 9) { push_s(out, "\\t"); }
+        else if (c == 8) { push_s(out, "\\b"); }
+        else if (c == 12) { push_s(out, "\\f"); }
+        else { out.push(c); }
+        i = i + 1;
+    }
+    out.push(34);
+}
+
+// Fixed-point micros -> JSON number text ("25", "33.3", "-0.5", ...).
+fn num_to_str(v: i64) -> str {
+    let out = String::new();
+    let neg = (v < 0);
+    let mut a = v;
+    if (neg) {
+        a = 0 - a;
+        out.push(45);
+    }
+    let ip = a / 1000000;
+    let fp = a % 1000000;
+    out.push_str(int_to_str(ip));
+    if (fp > 0) {
+        out.push(46);
+        let fs = format("%06lld", fp);
+        let n = len(fs);
+        let mut end = n;
+        while ((end > 0) && (fs[end - 1] == 48)) {
+            end = end - 1;
+        }
+        let sub = substr(fs, 0, end);
+        str_free(fs);
+        out.push_str(sub);
+        str_free(sub);
+    }
+    return out.data();
+}
+
+// Index-based serializer: `idx` is a value-vals index. Avoiding passing Jv by
+// value in the recursive call keeps the stack frame small (an i64 vs a 32-byte
+// enum) so deep flat arrays don't exhaust the ~1MB pyext thread stack.
+fn ser_idx(idx: i64, vals: &Vec<Jv>, out: &mut Vec<i64>) {
+    match (vals.get(idx)) {
+        Null => { push_s(out, "null"); }
+        B(b) => { if (b) { push_s(out, "true"); } else { push_s(out, "false"); } }
+        N(x) => {
+            let s = num_to_str(x);
+            push_s(out, s);
+            str_free(s);
+        }
+        S(s) => { ser_string_raw(s, out); }
+        A(items) => {
+            out.push(91);
+            let n = items.len();
+            let i = 0;
+            while (i < n) {
+                if (i > 0) { out.push(44); }
+                ser_idx(items.get(i), vals, out);
+                i = i + 1;
+            }
+            out.push(93);
+        }
+        O(pairs) => {
+            out.push(123);
+            let n = pairs.len();
+            let i = 0;
+            while (i < n) {
+                if (i > 0) { out.push(44); }
+                let ki = pairs.get(i);
+                let vi = pairs.get(i + 1);
+                ser_string_raw(as_str(vals.get(ki)), out);
+                out.push(58);
+                ser_idx(vi, vals, out);
+                i = i + 2;
+            }
+            out.push(125);
+        }
+    }
+}
+
+fn json_root(data: str) -> String {
+    let pos = 0;
+    let n = len(data);
+    let vals: Vec<Jv> = Vec::new();
+    let mut jerr: i64 = 0;
+    let root = parse_value(data, n, &mut pos, &mut vals, &mut jerr);
+    let mut out: Vec<i64> = Vec::new();
+    ser_idx(root, &vals, &mut out);
+    return bytes_to_string(&mut out);
+}
+
+#[py_export]
+fn parse_json(data: str) -> String {
+    return json_root(data);
+}
+
+// Debug helper: parse only (no serialization), return the value count.
+#[py_export]
+fn parse_only(data: str) -> i64 {
+    let vals: Vec<Jv> = Vec::new();
+    let pos = 0;
+    let n = len(data);
+    let mut jerr: i64 = 0;
+    parse_value(data, n, &mut pos, &mut vals, &mut jerr);
+    return vals.len();
+}
+
+fn ser_one(x: i64, out: &mut Vec<i64>) {
+    out.push(48 + x);
+}
+
+// Debug: non-recursive loop building "[0,0,...]".
+#[py_export]
+fn ser_loop(n: i64) -> String {
+    let mut out: Vec<i64> = Vec::new();
+    out.push(91);
+    let mut i: i64 = 0;
+    while (i < n) {
+        if (i > 0) { out.push(44); }
+        out.push(48);
+        i = i + 1;
+    }
+    out.push(93);
+    return bytes_to_string(&mut out);
+}
+
+// Debug: loop calling a void recursive helper per element (mirrors ser_value).
+#[py_export]
+fn ser_rec(n: i64) -> String {
+    let mut out: Vec<i64> = Vec::new();
+    out.push(91);
+    let mut i: i64 = 0;
+    while (i < n) {
+        if (i > 0) { out.push(44); }
+        ser_one(0, &mut out);
+        i = i + 1;
+    }
+    out.push(93);
+    return bytes_to_string(&mut out);
+}
+
+// Debug: build a flat array of n zeros and serialize it with the real ser_value.
+#[py_export]
+fn ser_test(n: i64) -> String {
+    let mut vals: Vec<Jv> = Vec::new();
+    vals.push(Jv::N(0));
+    let mut items: Vec<i64> = Vec::new();
+    let mut i: i64 = 0;
+    while (i < n) {
+        items.push(0);
+        i = i + 1;
+    }
+    vals.push(Jv::A(items));
+    let mut out: Vec<i64> = Vec::new();
+    ser_idx(1, &vals, &mut out);
+    return bytes_to_string(&mut out);
+}
+
+// =====================================================================
+// JMESPath expression layer (lexer + Pratt parser + evaluator)
+// =====================================================================
+//
+// Ported from jmespath.py's Pratt parser (BINDING_POWER) and TreeInterpreter
+// semantics. Errors are signalled through `err`: 0 = ok, 1 = syntax, 2 = invalid-value.
+// `search()` returns the serialized result, or "\x1eERR1" / "\x1eERR2" on error.
+
+#[derive(Copy)]
+enum Tok {
+    Eof,
+    Field(str),      // unquoted or quoted identifier (decoded)
+    Lit(i64),        // literal value index in the value vals
+    Num(i64),        // integer for index/slice
+    Cur,             // @
+    Lb, Rb,          // [ ]
+    Lc, Rc,          // { }
+    Lp, Rp,          // ( )
+    Dot, Pipe, Or, And, Not,
+    Eq, Ne, Lt, Lte, Gt, Gte,
+    Star, Comma, Colon,
+    Flat,            // []
+    Filter,          // [?
+}
+
+struct Pair {
+    a: i64,
+    b: i64,
+}
+
+struct Tri {
+    a: i64,
+    b: i64,
+    c: i64,
+}
+
+enum Ast {
+    Field(str),
+    Index(i64),
+    Slice(Tri),          // a=start b=stop c=step (none_sentinel = omitted)
+    Cur,
+    Lit(i64),
+    Id,
+    Or(Pair),
+    And(Pair),
+    Not(i64),
+    Cmp(Tri),            // a=op b=left c=right (op: 0 eq 1 ne 2 lt 3 lte 4 gt 5 gte)
+    Pipe(Pair),
+    Sub(Vec<i64>),
+    IdxExpr(Vec<i64>),
+    Flat(i64),
+    Proj(Pair),          // a=left b=right
+    VProj(Pair),
+    FProj(Tri),          // a=left b=right c=cond
+    MList(Vec<i64>),
+    MHash(Vec<i64>),     // [key_value_idx, val_ast, ...]
+}
+
+fn none_sentinel() -> i64 {
+    return -2147483648;
+}
+
+fn tok_type(t: Tok) -> i64 {
+    match (t) {
+        Eof => { return 0; }
+        Tok::Field(x) => { return 1; }
+        Tok::Lit(x) => { return 2; }
+        Num(x) => { return 3; }
+        Tok::Cur => { return 4; }
+        Lb => { return 5; }
+        Rb => { return 6; }
+        Lc => { return 7; }
+        Rc => { return 8; }
+        Lp => { return 9; }
+        Rp => { return 10; }
+        Dot => { return 11; }
+        Tok::Pipe => { return 12; }
+        Tok::Or => { return 13; }
+        Tok::And => { return 14; }
+        Tok::Not => { return 15; }
+        Eq => { return 16; }
+        Ne => { return 17; }
+        Lt => { return 18; }
+        Lte => { return 19; }
+        Gt => { return 20; }
+        Gte => { return 21; }
+        Star => { return 22; }
+        Comma => { return 23; }
+        Colon => { return 24; }
+        Tok::Flat => { return 25; }
+        Filter => { return 26; }
+    }
+    return -1;
+}
+
+fn tok_bp(t: Tok) -> i64 {
+    let ty = tok_type(t);
+    if (ty == 12) { return 1; }
+    if (ty == 13) { return 2; }
+    if (ty == 14) { return 3; }
+    if ((ty == 16) || (ty == 17) || (ty == 18) || (ty == 19) || (ty == 20) || (ty == 21)) { return 5; }
+    if (ty == 25) { return 9; }
+    if (ty == 22) { return 20; }
+    if (ty == 26) { return 21; }
+    if (ty == 11) { return 40; }
+    if (ty == 15) { return 45; }
+    if (ty == 7) { return 50; }
+    if (ty == 5) { return 55; }
+    if (ty == 9) { return 60; }
+    return 0;
+}
+
+fn tok_field(t: Tok) -> str {
+    match (t) {
+        Tok::Field(n) => { return n; }
+        _ => { return ""; }
+    }
+    return "";
+}
+
+fn tok_num(t: Tok) -> i64 {
+    match (t) {
+        Num(n) => { return n; }
+        _ => { return 0; }
+    }
+    return 0;
+}
+
+fn tok_lit(t: Tok) -> i64 {
+    match (t) {
+        Tok::Lit(n) => { return n; }
+        _ => { return 0; }
+    }
+    return 0;
+}
+
+fn ast_is_sub(a: i64, ast: &mut Vec<Ast>) -> i64 {
+    match (ast.get(a)) {
+        Sub(c) => { return 1; }
+        _ => { return 0; }
+    }
+    return 0;
+}
+
+fn ast_sub_children(a: i64, ast: &mut Vec<Ast>) -> Vec<i64> {
+    match (ast.get(a)) {
+        Sub(c) => { return c; }
+        _ => { let e: Vec<i64> = Vec::new(); return e; }
+    }
+}
+
+fn ast_is_idx(a: i64, ast: &mut Vec<Ast>) -> i64 {
+    match (ast.get(a)) {
+        IdxExpr(c) => { return 1; }
+        _ => { return 0; }
+    }
+    return 0;
+}
+
+fn ast_idx_children(a: i64, ast: &mut Vec<Ast>) -> Vec<i64> {
+    match (ast.get(a)) {
+        IdxExpr(c) => { return c; }
+        _ => { let e: Vec<i64> = Vec::new(); return e; }
+    }
+}
+
+fn ast_push(ast: &mut Vec<Ast>, node: Ast) -> i64 {
+    ast.push(node);
+    return ast.len() - 1;
+}
+
+fn vec_of_two(a: i64, b: i64) -> Vec<i64> {
+    let v: Vec<i64> = Vec::new();
+    v.push(a);
+    v.push(b);
+    return v;
+}
+
+fn vec_copy(v: &Vec<i64>) -> Vec<i64> {
+    let nv: Vec<i64> = Vec::new();
+    let n = v.len();
+    let i = 0;
+    while (i < n) {
+        nv.push(v.get(i));
+        i = i + 1;
+    }
+    return nv;
+}
+
+// Decode a JSON-style quoted string starting at data[*pos] == '"'.
+// Updates pos past the closing quote and returns a leaked str.
+fn decode_quoted(data: str, pos: &mut i64) -> str {
+    let n = len(data);
+    *pos = *pos + 1;
+    let mut sb: String = String::with_cap(8);
+    let esc = 0;
+    while (*pos < n) {
+        let c = data[*pos];
+        if (esc == 1) {
+            if (c == 34) { sb.push(34); *pos = *pos + 1; }
+            else if (c == 92) { sb.push(92); *pos = *pos + 1; }
+            else if (c == 47) { sb.push(47); *pos = *pos + 1; }
+            else if (c == 98) { sb.push(8); *pos = *pos + 1; }
+            else if (c == 102) { sb.push(12); *pos = *pos + 1; }
+            else if (c == 110) { sb.push(10); *pos = *pos + 1; }
+            else if (c == 114) { sb.push(13); *pos = *pos + 1; }
+            else if (c == 116) { sb.push(9); *pos = *pos + 1; }
+            else if (c == 117) {
+                let cp = read_hex4(data, *pos + 1);
+                if ((cp >= 55296) && (cp <= 56319)) {
+                    if ((*pos + 7 < n) && (data[*pos + 5] == 92) && (data[*pos + 6] == 117)) {
+                        let lo = read_hex4(data, *pos + 7);
+                        let combined = 65536 + (cp - 55296) * 1024 + (lo - 56320);
+                        sb = utf8_push_std(sb, combined);
+                        *pos = *pos + 11;
+                    } else {
+                        sb = utf8_push_std(sb, cp);
+                        *pos = *pos + 5;
+                    }
+                } else {
+                    sb = utf8_push_std(sb, cp);
+                    *pos = *pos + 5;
+                }
+            } else {
+                sb.push(c);
+                *pos = *pos + 1;
+            }
+            esc = 0;
+        } else if (c == 92) {
+            esc = 1;
+            *pos = *pos + 1;
+        } else if (c == 34) {
+            *pos = *pos + 1;
+            break;
+        } else {
+            sb.push(c);
+            *pos = *pos + 1;
+        }
+    }
+    return sb.data();
+}
+
+// Decode a raw string literal starting at data[*pos] == '\''.
+// A backslash is consumed together with the following character:
+// `\'` -> `'`, any other `\X` -> the two literal characters `\X`.
+fn decode_rawstr(data: str, pos: &mut i64) -> str {
+    let n = len(data);
+    *pos = *pos + 1;
+    let sb: Vec<i64> = Vec::new();
+    while (*pos < n) {
+        let c = data[*pos];
+        if (c == 39) {
+            *pos = *pos + 1;
+            break;
+        } else if (c == 92) {
+            if ((*pos + 1 < n) && (data[*pos + 1] == 39)) {
+                sb.push(39);
+                *pos = *pos + 2;
+            } else if (*pos + 1 < n) {
+                sb.push(92);
+                sb.push(data[*pos + 1]);
+                *pos = *pos + 2;
+            } else {
+                sb.push(92);
+                *pos = *pos + 1;
+            }
+        } else {
+            sb.push(c);
+            *pos = *pos + 1;
+        }
+    }
+    return bytes_to_str(&mut sb);
+}
+
+// Scan a backtick literal, parse its JSON content into the value vals and
+// return the resulting vals index. `\`` is an escaped backtick.
+fn lex_literal(data: str, pos: &mut i64, vals: &mut Vec<Jv>) -> i64 {
+    let n = len(data);
+    *pos = *pos + 1;
+    let sb: Vec<i64> = Vec::new();
+    let esc = 0;
+    while (*pos < n) {
+        let c = data[*pos];
+        if (esc == 1) {
+            if (c == 96) {
+                sb.push(96);
+            } else {
+                sb.push(92);
+                sb.push(c);
+            }
+            *pos = *pos + 1;
+            esc = 0;
+        } else if (c == 92) {
+            esc = 1;
+            *pos = *pos + 1;
+        } else if (c == 96) {
+            *pos = *pos + 1;
+            break;
+        } else {
+            sb.push(c);
+            *pos = *pos + 1;
+        }
+    }
+    let json = bytes_to_str(&mut sb);
+    let jpos = 0;
+    let jn = len(json);
+    let mut jerr: i64 = 0;
+    let root = parse_value(json, jn, &mut jpos, vals, &mut jerr);
+    return root;
+}
+
+fn lex(expr: str, vals: &mut Vec<Jv>, err: &mut i64) -> Vec<Tok> {
+    let toks: Vec<Tok> = Vec::new();
+    let n = len(expr);
+    let mut pos: i64 = 0;
+    while (pos < n) {
+        let c = expr[pos];
+        if ((c == 32) || (c == 9) || (c == 10) || (c == 13)) {
+            pos = pos + 1;
+            continue;
+        }
+        if (c == 46) { toks.push(Tok::Dot); pos = pos + 1; continue; }
+        if (c == 42) { toks.push(Tok::Star); pos = pos + 1; continue; }
+        if (c == 64) { toks.push(Tok::Cur); pos = pos + 1; continue; }
+        if (c == 44) { toks.push(Tok::Comma); pos = pos + 1; continue; }
+        if (c == 58) { toks.push(Tok::Colon); pos = pos + 1; continue; }
+        if (c == 91) {
+            if ((pos + 1 < n) && (expr[pos + 1] == 93)) {
+                toks.push(Tok::Flat);
+                pos = pos + 2;
+                continue;
+            }
+            if ((pos + 1 < n) && (expr[pos + 1] == 63)) {
+                toks.push(Tok::Filter);
+                pos = pos + 2;
+                continue;
+            }
+            toks.push(Tok::Lb);
+            pos = pos + 1;
+            continue;
+        }
+        if (c == 93) { toks.push(Tok::Rb); pos = pos + 1; continue; }
+        if (c == 123) { toks.push(Tok::Lc); pos = pos + 1; continue; }
+        if (c == 125) { toks.push(Tok::Rc); pos = pos + 1; continue; }
+        if (c == 40) { toks.push(Tok::Lp); pos = pos + 1; continue; }
+        if (c == 41) { toks.push(Tok::Rp); pos = pos + 1; continue; }
+        if (c == 124) {
+            if ((pos + 1 < n) && (expr[pos + 1] == 124)) {
+                toks.push(Tok::Or);
+                pos = pos + 2;
+                continue;
+            }
+            toks.push(Tok::Pipe);
+            pos = pos + 1;
+            continue;
+        }
+        if (c == 38) {
+            if ((pos + 1 < n) && (expr[pos + 1] == 38)) {
+                toks.push(Tok::And);
+                pos = pos + 2;
+                continue;
+            }
+            *err = 1;
+            toks.push(Tok::Eof);
+            return toks;
+        }
+        if (c == 33) {
+            if ((pos + 1 < n) && (expr[pos + 1] == 61)) {
+                toks.push(Tok::Ne);
+                pos = pos + 2;
+                continue;
+            }
+            toks.push(Tok::Not);
+            pos = pos + 1;
+            continue;
+        }
+        if (c == 61) {
+            if ((pos + 1 < n) && (expr[pos + 1] == 61)) {
+                toks.push(Tok::Eq);
+                pos = pos + 2;
+                continue;
+            }
+            *err = 1;
+            toks.push(Tok::Eof);
+            return toks;
+        }
+        if (c == 60) {
+            if ((pos + 1 < n) && (expr[pos + 1] == 61)) {
+                toks.push(Tok::Lte);
+                pos = pos + 2;
+                continue;
+            }
+            toks.push(Tok::Lt);
+            pos = pos + 1;
+            continue;
+        }
+        if (c == 62) {
+            if ((pos + 1 < n) && (expr[pos + 1] == 61)) {
+                toks.push(Tok::Gte);
+                pos = pos + 2;
+                continue;
+            }
+            toks.push(Tok::Gt);
+            pos = pos + 1;
+            continue;
+        }
+        if (c == 96) {
+            let v = lex_literal(expr, &mut pos, vals);
+            toks.push(Tok::Lit(v));
+            continue;
+        }
+        if (c == 39) {
+            let s = decode_rawstr(expr, &mut pos);
+            let sidx = push_str_value(vals, s);
+            toks.push(Tok::Lit(sidx));
+            continue;
+        }
+        if (c == 34) {
+            let s = decode_quoted(expr, &mut pos);
+            toks.push(Tok::Field(s));
+            continue;
+        }
+        // number: optional '-' then digits
+        if ((c >= 48) && (c <= 57)) {
+            let start = pos;
+            let mut neg = 0;
+            while ((pos < n) && ((expr[pos] >= 48) && (expr[pos] <= 57))) {
+                pos = pos + 1;
+            }
+            let sub = substr(expr, start, pos);
+            let v = str_to_int(sub);
+            str_free(sub);
+            toks.push(Tok::Num(v));
+            continue;
+        }
+        if (c == 45) {
+            if ((pos + 1 < n) && ((expr[pos + 1] >= 48) && (expr[pos + 1] <= 57))) {
+                let start = pos;
+                pos = pos + 1;
+                while ((pos < n) && ((expr[pos] >= 48) && (expr[pos] <= 57))) {
+                    pos = pos + 1;
+                }
+                let sub = substr(expr, start, pos);
+                let v = str_to_int(sub);
+                str_free(sub);
+                toks.push(Tok::Num(v));
+                continue;
+            }
+            *err = 1;
+            toks.push(Tok::Eof);
+            return toks;
+        }
+        // unquoted identifier
+        if ((c == 95) || ((c >= 65) && (c <= 90)) || ((c >= 97) && (c <= 122))) {
+            let start = pos;
+            while ((pos < n)) {
+                let cc = expr[pos];
+                if ((cc == 95) || ((cc >= 48) && (cc <= 57)) || ((cc >= 65) && (cc <= 90)) || ((cc >= 97) && (cc <= 122))) {
+                    pos = pos + 1;
+                } else {
+                    break;
+                }
+            }
+            let sub = substr(expr, start, pos);
+            toks.push(Tok::Field(sub));
+            continue;
+        }
+        *err = 1;
+        toks.push(Tok::Eof);
+        return toks;
+    }
+    toks.push(Tok::Eof);
+    return toks;
+}
+
+fn push_str_value(vals: &mut Vec<Jv>, s: str) -> i64 {
+    vals.push(Jv::S(s));
+    return vals.len() - 1;
+}
+
+// ---- parser (Pratt) ----
+
+fn is_ast_slice(a: i64, ast: &mut Vec<Ast>) -> i64 {
+    match (ast.get(a)) {
+        Slice(t) => { return 1; }
+        _ => { return 0; }
+    }
+    return 0;
+}
+
+fn parse_index_expression(tokens: &Vec<Tok>, ti: &mut i64, ast: &mut Vec<Ast>, err: &mut i64) -> i64 {
+    let t0 = tokens.get(*ti);
+    let t1 = tokens.get(*ti + 1);
+    let ty0 = tok_type(t0);
+    let ty1 = tok_type(t1);
+    if ((ty0 == 24) || (ty1 == 24)) {
+        return parse_slice_expression(tokens, ti, ast, err);
+    }
+    // [number]
+    if (tok_type(t0) != 3) {
+        *err = 1;
+        return 0;
+    }
+    let nv = tok_num(t0);
+    *ti = *ti + 1;
+    let t = tokens.get(*ti);
+    if (tok_type(t) == 6) {
+        *ti = *ti + 1;
+    } else {
+        *err = 1;
+        return 0;
+    }
+    return ast_push(ast, Ast::Index(nv));
+}
+
+fn parse_slice_expression(tokens: &Vec<Tok>, ti: &mut i64, ast: &mut Vec<Ast>, err: &mut i64) -> i64 {
+    let mut p0 = none_sentinel();
+    let mut p1 = none_sentinel();
+    let mut p2 = none_sentinel();
+    let mut index: i64 = 0;
+    let mut go = 1;
+    while (go == 1) {
+        let t = tokens.get(*ti);
+        let ty = tok_type(t);
+        if ((ty == 6) || (index >= 3)) {
+            go = 0;
+        } else if (ty == 24) {
+            index = index + 1;
+            if (index >= 3) {
+                *err = 1;
+                return 0;
+            }
+            *ti = *ti + 1;
+        } else if (ty == 3) {
+            let v = tok_num(t);
+            if (index == 0) { p0 = v; }
+            else if (index == 1) { p1 = v; }
+            else { p2 = v; }
+            *ti = *ti + 1;
+        } else {
+            *err = 1;
+            return 0;
+        }
+    }
+    // match rbracket
+    let t = tokens.get(*ti);
+    if (tok_type(t) == 6) {
+        *ti = *ti + 1;
+    } else {
+        *err = 1;
+        return 0;
+    }
+    return ast_push(ast, Ast::Slice(Tri { a: p0, b: p1, c: p2 }));
+}
+
+fn parse_multi_select_list(tokens: &Vec<Tok>, ti: &mut i64, vals: &mut Vec<Jv>, ast: &mut Vec<Ast>, err: &mut i64) -> i64 {
+    let items: Vec<i64> = Vec::new();
+    let mut go = 1;
+    while (go == 1) {
+        let e = parse_expr(tokens, ti, vals, ast, err, 0);
+        items.push(e);
+        if (*err != 0) { return 0; }
+        let t = tokens.get(*ti);
+        let ty = tok_type(t);
+        if (ty == 6) {
+            *ti = *ti + 1;
+            go = 0;
+        } else if (ty == 23) {
+            *ti = *ti + 1;
+        } else {
+            *err = 1;
+            return 0;
+        }
+    }
+    return ast_push(ast, Ast::MList(items));
+}
+
+fn parse_multi_select_hash(tokens: &Vec<Tok>, ti: &mut i64, vals: &mut Vec<Jv>, ast: &mut Vec<Ast>, err: &mut i64) -> i64 {
+    let pairs: Vec<i64> = Vec::new();
+    let mut go = 1;
+    while (go == 1) {
+        let kt = tokens.get(*ti);
+        if (tok_type(kt) != 1) {
+            *err = 1;
+            return 0;
+        }
+        let kname = tok_field(kt);
+        *ti = *ti + 1;
+        // colon
+        let t = tokens.get(*ti);
+        if (tok_type(t) == 24) {
+            *ti = *ti + 1;
+        } else {
+            *err = 1;
+            return 0;
+        }
+        let kidx = push_str_value(vals, kname);
+        let value = parse_expr(tokens, ti, vals, ast, err, 0);
+        if (*err != 0) { return 0; }
+        pairs.push(kidx);
+        pairs.push(value);
+        let t2 = tokens.get(*ti);
+        let ty2 = tok_type(t2);
+        if (ty2 == 23) {
+            *ti = *ti + 1;
+        } else if (ty2 == 8) {
+            *ti = *ti + 1;
+            go = 0;
+        } else {
+            *err = 1;
+            return 0;
+        }
+    }
+    return ast_push(ast, Ast::MHash(pairs));
+}
+
+fn project_if_slice(left: i64, right: i64, tokens: &Vec<Tok>, ti: &mut i64, vals: &mut Vec<Jv>, ast: &mut Vec<Ast>, err: &mut i64) -> i64 {
+    let ch = vec_of_two(left, right);
+    let idxexpr = ast_push(ast, Ast::IdxExpr(ch));
+    if (is_ast_slice(right, ast) == 1) {
+        let rhs = parse_projection_rhs(tokens, ti, vals, ast, err, 20);
+        return ast_push(ast, Ast::Proj(Pair { a: idxexpr, b: rhs }));
+    }
+    return idxexpr;
+}
+
+fn parse_dot_rhs(tokens: &Vec<Tok>, ti: &mut i64, vals: &mut Vec<Jv>, ast: &mut Vec<Ast>, err: &mut i64, bp: i64) -> i64 {
+    let t = tokens.get(*ti);
+    let ty = tok_type(t);
+    if ((ty == 1) || (ty == 22)) {
+        return parse_expr(tokens, ti, vals, ast, err, bp);
+    }
+    if (ty == 5) {
+        *ti = *ti + 1;
+        return parse_multi_select_list(tokens, ti, vals, ast, err);
+    }
+    if (ty == 7) {
+        *ti = *ti + 1;
+        return parse_multi_select_hash(tokens, ti, vals, ast, err);
+    }
+    *err = 1;
+    return 0;
+}
+
+fn parse_projection_rhs(tokens: &Vec<Tok>, ti: &mut i64, vals: &mut Vec<Jv>, ast: &mut Vec<Ast>, err: &mut i64, bp: i64) -> i64 {
+    let t = tokens.get(*ti);
+    let ty = tok_type(t);
+    if (tok_bp(t) < 10) {
+        return ast_push(ast, Ast::Id);
+    }
+    if (ty == 5) {
+        return parse_expr(tokens, ti, vals, ast, err, bp);
+    }
+    if (ty == 26) {
+        return parse_expr(tokens, ti, vals, ast, err, bp);
+    }
+    if (ty == 11) {
+        *ti = *ti + 1;
+        return parse_dot_rhs(tokens, ti, vals, ast, err, bp);
+    }
+    *err = 1;
+    return 0;
+}
+
+// nud: parse a leading token into an AST node.
+fn parse_nud(t: Tok, tokens: &Vec<Tok>, ti: &mut i64, vals: &mut Vec<Jv>, ast: &mut Vec<Ast>, err: &mut i64) -> i64 {
+    let ty = tok_type(t);
+    if (ty == 1) {
+        let name = tok_field(t);
+        return ast_push(ast, Ast::Field(name));
+    }
+    if (ty == 2) {
+        let v = tok_lit(t);
+        return ast_push(ast, Ast::Lit(v));
+    }
+    if (ty == 4) {
+        return ast_push(ast, Ast::Cur);
+    }
+    if (ty == 22) {
+        // star
+        let id = ast_push(ast, Ast::Id);
+        let mut right: i64 = 0;
+        let t2 = tokens.get(*ti);
+        if (tok_type(t2) == 6) {
+            right = ast_push(ast, Ast::Id);
+        } else {
+            right = parse_projection_rhs(tokens, ti, vals, ast, err, 20);
+        }
+        return ast_push(ast, Ast::VProj(Pair { a: id, b: right }));
+    }
+    if (ty == 25) {
+        // flatten at start: projection(flatten(identity), rhs)
+        let id = ast_push(ast, Ast::Id);
+        let flat = ast_push(ast, Ast::Flat(id));
+        let right = parse_projection_rhs(tokens, ti, vals, ast, err, 9);
+        return ast_push(ast, Ast::Proj(Pair { a: flat, b: right }));
+    }
+    if (ty == 26) {
+        // filter at start: filter_projection(identity, rhs, cond)
+        return parse_led_filter(ast_push(ast, Ast::Id), tokens, ti, vals, ast, err);
+    }
+    if (ty == 7) {
+        return parse_multi_select_hash(tokens, ti, vals, ast, err);
+    }
+    if (ty == 9) {
+        let e = parse_expr(tokens, ti, vals, ast, err, 0);
+        let t2 = tokens.get(*ti);
+        if (tok_type(t2) == 10) {
+            *ti = *ti + 1;
+        } else {
+            *err = 1;
+        }
+        return e;
+    }
+    if (ty == 15) {
+        let e = parse_expr(tokens, ti, vals, ast, err, 45);
+        return ast_push(ast, Ast::Not(e));
+    }
+    if (ty == 5) {
+        // [
+        let t2 = tokens.get(*ti);
+        let ty2 = tok_type(t2);
+        if ((ty2 == 3) || (ty2 == 24)) {
+            let right = parse_index_expression(tokens, ti, ast, err);
+            if (*err != 0) { return 0; }
+            let id = ast_push(ast, Ast::Id);
+            return project_if_slice(id, right, tokens, ti, vals, ast, err);
+        }
+        if ((ty2 == 22) && (tok_type(tokens.get(*ti + 1)) == 6)) {
+            *ti = *ti + 1;
+            *ti = *ti + 1;
+            let id = ast_push(ast, Ast::Id);
+            let right = parse_projection_rhs(tokens, ti, vals, ast, err, 20);
+            return ast_push(ast, Ast::Proj(Pair { a: id, b: right }));
+        }
+        return parse_multi_select_list(tokens, ti, vals, ast, err);
+    }
+    *err = 1;
+    return 0;
+}
+
+// led: parse an infix/postfix continuation given the left AST node.
+fn parse_led(t: Tok, left: i64, tokens: &Vec<Tok>, ti: &mut i64, vals: &mut Vec<Jv>, ast: &mut Vec<Ast>, err: &mut i64) -> i64 {
+    let ty = tok_type(t);
+    if (ty == 12) {
+        let right = parse_expr(tokens, ti, vals, ast, err, 1);
+        return ast_push(ast, Ast::Pipe(Pair { a: left, b: right }));
+    }
+    if (ty == 13) {
+        let right = parse_expr(tokens, ti, vals, ast, err, 2);
+        return ast_push(ast, Ast::Or(Pair { a: left, b: right }));
+    }
+    if (ty == 14) {
+        let right = parse_expr(tokens, ti, vals, ast, err, 3);
+        return ast_push(ast, Ast::And(Pair { a: left, b: right }));
+    }
+    if ((ty == 16) || (ty == 17) || (ty == 18) || (ty == 19) || (ty == 20) || (ty == 21)) {
+        let right = parse_expr(tokens, ti, vals, ast, err, 5);
+        let op = ty - 16;
+        return ast_push(ast, Ast::Cmp(Tri { a: op, b: left, c: right }));
+    }
+    if (ty == 11) {
+        let t2 = tokens.get(*ti);
+        if (tok_type(t2) == 22) {
+            *ti = *ti + 1;
+            let right = parse_projection_rhs(tokens, ti, vals, ast, err, 40);
+            return ast_push(ast, Ast::VProj(Pair { a: left, b: right }));
+        }
+        let right = parse_dot_rhs(tokens, ti, vals, ast, err, 40);
+        if (*err != 0) { return 0; }
+        // if left is Sub, append; else Sub([left, right])
+        if (ast_is_sub(left, ast) == 1) {
+            let ch = ast_sub_children(left, ast);
+            let mut nch = vec_copy(&ch);
+            nch.push(right);
+            return ast_push(ast, Ast::Sub(nch));
+        }
+        let ch = vec_of_two(left, right);
+        return ast_push(ast, Ast::Sub(ch));
+    }
+    if (ty == 25) {
+        // flatten postfix: projection(flatten(left), rhs)
+        let flat = ast_push(ast, Ast::Flat(left));
+        let right = parse_projection_rhs(tokens, ti, vals, ast, err, 9);
+        return ast_push(ast, Ast::Proj(Pair { a: flat, b: right }));
+    }
+    if (ty == 5) {
+        let t2 = tokens.get(*ti);
+        let ty2 = tok_type(t2);
+        if ((ty2 == 3) || (ty2 == 24)) {
+            let right = parse_index_expression(tokens, ti, ast, err);
+            if (*err != 0) { return 0; }
+            if (ast_is_idx(left, ast) == 1) {
+                let ch = ast_idx_children(left, ast);
+                let mut nch = vec_copy(&ch);
+                nch.push(right);
+                return ast_push(ast, Ast::IdxExpr(nch));
+            }
+            return project_if_slice(left, right, tokens, ti, vals, ast, err);
+        }
+        // [*]
+        *ti = *ti + 1;  // star
+        let t3 = tokens.get(*ti);
+        if (tok_type(t3) == 6) {
+            *ti = *ti + 1;
+        } else {
+            *err = 1;
+            return 0;
+        }
+        let right = parse_projection_rhs(tokens, ti, vals, ast, err, 20);
+        return ast_push(ast, Ast::Proj(Pair { a: left, b: right }));
+    }
+    if (ty == 26) {
+        return parse_led_filter(left, tokens, ti, vals, ast, err);
+    }
+    *err = 1;
+    return 0;
+}
+
+fn parse_led_filter(left: i64, tokens: &Vec<Tok>, ti: &mut i64, vals: &mut Vec<Jv>, ast: &mut Vec<Ast>, err: &mut i64) -> i64 {
+    let cond = parse_expr(tokens, ti, vals, ast, err, 0);
+    if (*err != 0) { return 0; }
+    let t = tokens.get(*ti);
+    if (tok_type(t) == 6) {
+        *ti = *ti + 1;
+    } else {
+        *err = 1;
+        return 0;
+    }
+    let mut right: i64 = 0;
+    let t2 = tokens.get(*ti);
+    if (tok_type(t2) == 25) {
+        right = ast_push(ast, Ast::Id);
+    } else {
+        right = parse_projection_rhs(tokens, ti, vals, ast, err, 21);
+    }
+    return ast_push(ast, Ast::FProj(Tri { a: left, b: right, c: cond }));
+}
+
+fn parse_expr(tokens: &Vec<Tok>, ti: &mut i64, vals: &mut Vec<Jv>, ast: &mut Vec<Ast>, err: &mut i64, bp: i64) -> i64 {
+    let t = tokens.get(*ti);
+    *ti = *ti + 1;
+    let mut left = parse_nud(t, tokens, ti, vals, ast, err);
+    if (*err != 0) { return 0; }
+    let mut go = 1;
+    while (go == 1) {
+        let ct = tokens.get(*ti);
+        let cbp = tok_bp(ct);
+        if (bp >= cbp) {
+            go = 0;
+        } else {
+            *ti = *ti + 1;
+            left = parse_led(ct, left, tokens, ti, vals, ast, err);
+            if (*err != 0) { return 0; }
+        }
+    }
+    return left;
+}
+
+fn parse_expr_to_ast(expr: str, vals: &mut Vec<Jv>, ast: &mut Vec<Ast>, err: &mut i64) -> i64 {
+    let tokens = lex(expr, vals, err);
+    if (*err != 0) { return 0; }
+    let mut ti: i64 = 0;
+    let root = parse_expr(&tokens, &mut ti, vals, ast, err, 0);
+    if (*err != 0) { return 0; }
+    // must consume eof
+    let t = tokens.get(ti);
+    if (tok_type(t) != 0) {
+        *err = 1;
+        return 0;
+    }
+    return root;
+}
+
+// ---- evaluator ----
+
+fn jv_tag(v: Jv) -> i64 {
+    match (v) {
+        Null => { return 0; }
+        B(x) => { return 1; }
+        N(x) => { return 2; }
+        S(x) => { return 3; }
+        A(x) => { return 4; }
+        O(x) => { return 5; }
+    }
+    return -1;
+}
+
+fn push_null(vals: &mut Vec<Jv>) -> i64 {
+    vals.push(Jv::Null);
+    return vals.len() - 1;
+}
+
+fn is_null(idx: i64, vals: &mut Vec<Jv>) -> bool {
+    let v = vals.get(idx);
+    match (v) {
+        Null => { return true; }
+        _ => { return false; }
+    }
+    return false;
+}
+
+fn truthy(idx: i64, vals: &mut Vec<Jv>) -> bool {
+    let v = vals.get(idx);
+    match (v) {
+        Null => { return false; }
+        B(x) => { return x; }
+        N(x) => { return true; }
+        S(s) => { return len(s) > 0; }
+        A(a) => { return a.len() > 0; }
+        O(o) => { return o.len() > 0; }
+    }
+    return true;
+}
+
+fn jv_eq(a: i64, b: i64, vals: &mut Vec<Jv>) -> bool {
+    let ta = jv_tag(vals.get(a));
+    let tb = jv_tag(vals.get(b));
+    if (ta != tb) { return false; }
+    if (ta == 0) { return true; }
+    if (ta == 1) {
+        let x = as_bool(vals.get(a));
+        let y = as_bool(vals.get(b));
+        return b2i(x) == b2i(y);
+    }
+    if (ta == 2) {
+        return as_num(vals.get(a)) == as_num(vals.get(b));
+    }
+    if (ta == 3) {
+        return str_cmp(as_str(vals.get(a)), as_str(vals.get(b))) == 0;
+    }
+    if (ta == 4) {
+        let ia = as_arr(vals.get(a));
+        let ib = as_arr(vals.get(b));
+        if (ia.len() != ib.len()) { return false; }
+        let k = 0;
+        while (k < ia.len()) {
+            if (b2i(jv_eq(ia.get(k), ib.get(k), vals)) == 0) { return false; }
+            k = k + 1;
+        }
+        return true;
+    }
+    if (ta == 5) {
+        let oa = as_obj(vals.get(a));
+        let ob = as_obj(vals.get(b));
+        if (oa.len() != ob.len()) { return false; }
+        let i = 0;
+        while (i < oa.len()) {
+            let keya = oa.get(i);
+            let vala = oa.get(i + 1);
+            let mut found = 0;
+            let mut vmatch: i64 = -1;
+            let j = 0;
+            while (j < ob.len()) {
+                let keyb = ob.get(j);
+                if (str_cmp(as_str(vals.get(keya)), as_str(vals.get(keyb))) == 0) {
+                    found = 1;
+                    vmatch = ob.get(j + 1);
+                    break;
+                }
+                j = j + 2;
+            }
+            if (found == 0) { return false; }
+            if (b2i(jv_eq(vala, vmatch, vals)) == 0) { return false; }
+            i = i + 2;
+        }
+        return true;
+    }
+    return false;
+}
+
+fn jv_cmp(a: i64, b: i64, vals: &mut Vec<Jv>) -> i64 {
+    let ta = jv_tag(vals.get(a));
+    let tb = jv_tag(vals.get(b));
+    if ((ta == 2) && (tb == 2)) {
+        let x = as_num(vals.get(a));
+        let y = as_num(vals.get(b));
+        if (x < y) { return -1; }
+        if (x > y) { return 1; }
+        return 0;
+    }
+    if ((ta == 3) && (tb == 3)) {
+        let r = str_cmp(as_str(vals.get(a)), as_str(vals.get(b)));
+        if (r < 0) { return -1; }
+        if (r > 0) { return 1; }
+        return 0;
+    }
+    return -99;
+}
+
+fn field_lookup(vals: &mut Vec<Jv>, cur: i64, name: str) -> i64 {
+    let v = vals.get(cur);
+    match (v) {
+        O(pairs) => {
+            let n = pairs.len();
+            let i = 0;
+            while (i < n) {
+                let ki = pairs.get(i);
+                if (str_cmp(as_str(vals.get(ki)), name) == 0) {
+                    return pairs.get(i + 1);
+                }
+                i = i + 2;
+            }
+            return push_null(vals);
+        }
+        _ => { }
+    }
+    return push_null(vals);
+}
+
+fn index_lookup(vals: &mut Vec<Jv>, cur: i64, n: i64) -> i64 {
+    let v = vals.get(cur);
+    match (v) {
+        A(items) => {
+            let l = items.len();
+            let mut idx = n;
+            if (idx < 0) {
+                idx = l + idx;
+            }
+            if ((idx >= 0) && (idx < l)) {
+                return items.get(idx);
+            }
+            return push_null(vals);
+        }
+        _ => { }
+    }
+    return push_null(vals);
+}
+
+fn slice_lookup(vals: &mut Vec<Jv>, cur: i64, s0: i64, s1: i64, s2: i64, err: &mut i64) -> i64 {
+    let v = vals.get(cur);
+    match (v) {
+        A(items) => {
+            let l = items.len();
+            let collect: Vec<i64> = Vec::new();
+            let mut step = s2;
+            if (step == none_sentinel()) {
+                step = 1;
+            }
+            if (step == 0) {
+                *err = 2;
+                return push_null(vals);
+            }
+            if (step > 0) {
+                let mut start = s0;
+                if (start == none_sentinel()) { start = 0; }
+                else if (start < 0) { start = l + start; if (start < 0) { start = 0; } }
+                else { if (start > l) { start = l; } }
+                let mut stop = s1;
+                if (stop == none_sentinel()) { stop = l; }
+                else if (stop < 0) { stop = l + stop; if (stop < 0) { stop = 0; } }
+                else { if (stop > l) { stop = l; } }
+                let mut i = start;
+                while (i < stop) {
+                    collect.push(items.get(i));
+                    i = i + step;
+                }
+            } else {
+                let mut start = s0;
+                if (start == none_sentinel()) { start = l - 1; }
+                else if (start < 0) { start = l + start; if (start < -1) { start = -1; } }
+                else { if (start >= l) { start = l - 1; } }
+                let mut stop = s1;
+                if (stop == none_sentinel()) { stop = -1; }
+                else if (stop < 0) { stop = l + stop; if (stop < -1) { stop = -1; } }
+                else { if (stop >= l) { stop = l - 1; } }
+                let mut i = start;
+                while (i > stop) {
+                    collect.push(items.get(i));
+                    i = i + step;
+                }
+            }
+            vals.push(Jv::A(collect));
+            return vals.len() - 1;
+        }
+        _ => { }
+    }
+    return push_null(vals);
+}
+
+fn flatten_value(base: i64, vals: &mut Vec<Jv>) -> i64 {
+    let v = vals.get(base);
+    match (v) {
+        A(items) => {
+            let collect: Vec<i64> = Vec::new();
+            let n = items.len();
+            let i = 0;
+            while (i < n) {
+                let ei = items.get(i);
+                let ev = vals.get(ei);
+                match (ev) {
+                    A(inner) => {
+                        let m = inner.len();
+                        let j = 0;
+                        while (j < m) {
+                            collect.push(inner.get(j));
+                            j = j + 1;
+                        }
+                    }
+                    _ => {
+                        collect.push(ei);
+                    }
+                }
+                i = i + 1;
+            }
+            vals.push(Jv::A(collect));
+            return vals.len() - 1;
+        }
+        _ => { }
+    }
+    return push_null(vals);
+}
+
+fn projection(base: i64, right: i64, ast: &Vec<Ast>, vals: &mut Vec<Jv>, err: &mut i64) -> i64 {
+    let v = vals.get(base);
+    match (v) {
+        A(items) => {
+            let collect: Vec<i64> = Vec::new();
+            let n = items.len();
+            let i = 0;
+            while (i < n) {
+                let r = eval(right, ast, vals, items.get(i), err);
+                if (*err != 0) { return push_null(vals); }
+                if (b2i(is_null(r, vals)) == 0) {
+                    collect.push(r);
+                }
+                i = i + 1;
+            }
+            vals.push(Jv::A(collect));
+            return vals.len() - 1;
+        }
+        _ => { }
+    }
+    return push_null(vals);
+}
+
+fn v_projection(base: i64, right: i64, ast: &Vec<Ast>, vals: &mut Vec<Jv>, err: &mut i64) -> i64 {
+    let v = vals.get(base);
+    match (v) {
+        O(pairs) => {
+            let collect: Vec<i64> = Vec::new();
+            let n = pairs.len();
+            let i = 0;
+            while (i < n) {
+                let vi = pairs.get(i + 1);
+                let r = eval(right, ast, vals, vi, err);
+                if (*err != 0) { return push_null(vals); }
+                if (b2i(is_null(r, vals)) == 0) {
+                    collect.push(r);
+                }
+                i = i + 2;
+            }
+            vals.push(Jv::A(collect));
+            return vals.len() - 1;
+        }
+        _ => { }
+    }
+    return push_null(vals);
+}
+
+fn f_projection(base: i64, right: i64, cond: i64, ast: &Vec<Ast>, vals: &mut Vec<Jv>, err: &mut i64) -> i64 {
+    let v = vals.get(base);
+    match (v) {
+        A(items) => {
+            let collect: Vec<i64> = Vec::new();
+            let n = items.len();
+            let i = 0;
+            while (i < n) {
+                let ei = items.get(i);
+                let c = eval(cond, ast, vals, ei, err);
+                if (*err != 0) { return push_null(vals); }
+                if (truthy(c, vals)) {
+                    let r = eval(right, ast, vals, ei, err);
+                    if (*err != 0) { return push_null(vals); }
+                    if (b2i(is_null(r, vals)) == 0) {
+                        collect.push(r);
+                    }
+                }
+                i = i + 1;
+            }
+            vals.push(Jv::A(collect));
+            return vals.len() - 1;
+        }
+        _ => { }
+    }
+    return push_null(vals);
+}
+
+fn eval(a: i64, ast: &Vec<Ast>, vals: &mut Vec<Jv>, cur: i64, err: &mut i64) -> i64 {
+    let node = ast.get(a);
+    match (node) {
+        Ast::Field(name) => {
+            return field_lookup(vals, cur, name);
+        }
+        Index(n) => {
+            return index_lookup(vals, cur, n);
+        }
+        Slice(t) => {
+            return slice_lookup(vals, cur, t.a, t.b, t.c, err);
+        }
+        Ast::Cur => { return cur; }
+        Ast::Lit(idx) => { return idx; }
+        Id => { return cur; }
+        Ast::Or(p) => {
+            let x = eval(p.a, ast, vals, cur, err);
+            if (*err != 0) { return x; }
+            if (truthy(x, vals)) { return x; }
+            return eval(p.b, ast, vals, cur, err);
+        }
+        Ast::And(p) => {
+            let x = eval(p.a, ast, vals, cur, err);
+            if (*err != 0) { return x; }
+            if (b2i(truthy(x, vals)) == 0) { return x; }
+            return eval(p.b, ast, vals, cur, err);
+        }
+        Ast::Not(x) => {
+            let v = eval(x, ast, vals, cur, err);
+            if (*err != 0) { return v; }
+            let vv = vals.get(v);
+            match (vv) {
+                N(z) => {
+                    if (z == 0) {
+                        vals.push(Jv::B(false));
+                        return vals.len() - 1;
+                    }
+                }
+                _ => { }
+            }
+            let t = truthy(v, vals);
+            if (t) {
+                vals.push(Jv::B(false));
+            } else {
+                vals.push(Jv::B(true));
+            }
+            return vals.len() - 1;
+        }
+        Cmp(t) => {
+            let op = t.a;
+            let l = t.b;
+            let r = t.c;
+            let x = eval(l, ast, vals, cur, err);
+            if (*err != 0) { return x; }
+            let y = eval(r, ast, vals, cur, err);
+            if (*err != 0) { return y; }
+            if (op == 0) {
+                vals.push(Jv::B(jv_eq(x, y, vals)));
+                return vals.len() - 1;
+            }
+            if (op == 1) {
+                vals.push(Jv::B(b2i(jv_eq(x, y, vals)) == 0));
+                return vals.len() - 1;
+            }
+            let c = jv_cmp(x, y, vals);
+            if (c == -99) {
+                return push_null(vals);
+            }
+            let mut res = 0;
+            if ((op == 2) && (c < 0)) { res = 1; }
+            if ((op == 3) && (c <= 0)) { res = 1; }
+            if ((op == 4) && (c > 0)) { res = 1; }
+            if ((op == 5) && (c >= 0)) { res = 1; }
+            if (res == 1) {
+                vals.push(Jv::B(true));
+            } else {
+                vals.push(Jv::B(false));
+            }
+            return vals.len() - 1;
+        }
+        Ast::Pipe(p) => {
+            let x = eval(p.a, ast, vals, cur, err);
+            if (*err != 0) { return x; }
+            return eval(p.b, ast, vals, x, err);
+        }
+        Sub(children) => {
+            let mut res = cur;
+            let n = children.len();
+            let i = 0;
+            while (i < n) {
+                res = eval(children.get(i), ast, vals, res, err);
+                if (*err != 0) { return res; }
+                i = i + 1;
+            }
+            return res;
+        }
+        IdxExpr(children) => {
+            let mut res = cur;
+            let n = children.len();
+            let i = 0;
+            while (i < n) {
+                res = eval(children.get(i), ast, vals, res, err);
+                if (*err != 0) { return res; }
+                i = i + 1;
+            }
+            return res;
+        }
+        Ast::Flat(x) => {
+            return flatten_value(eval(x, ast, vals, cur, err), vals);
+        }
+        Proj(p) => {
+            return projection(eval(p.a, ast, vals, cur, err), p.b, ast, vals, err);
+        }
+        VProj(p) => {
+            return v_projection(eval(p.a, ast, vals, cur, err), p.b, ast, vals, err);
+        }
+        FProj(t) => {
+            return f_projection(eval(t.a, ast, vals, cur, err), t.b, t.c, ast, vals, err);
+        }
+        MList(children) => {
+            if (is_null(cur, vals)) {
+                return push_null(vals);
+            }
+            let collect: Vec<i64> = Vec::new();
+            let n = children.len();
+            let i = 0;
+            while (i < n) {
+                let e = eval(children.get(i), ast, vals, cur, err);
+                if (*err != 0) { return e; }
+                collect.push(e);
+                i = i + 1;
+            }
+            vals.push(Jv::A(collect));
+            return vals.len() - 1;
+        }
+        MHash(pairs) => {
+            if (is_null(cur, vals)) {
+                return push_null(vals);
+            }
+            let collect: Vec<i64> = Vec::new();
+            let n = pairs.len();
+            let i = 0;
+            while (i < n) {
+                let kidx = pairs.get(i);
+                let val = eval(pairs.get(i + 1), ast, vals, cur, err);
+                if (*err != 0) { return val; }
+                collect.push(kidx);
+                collect.push(val);
+                i = i + 2;
+            }
+            vals.push(Jv::O(collect));
+            return vals.len() - 1;
+        }
+    }
+    return push_null(vals);
+}
+
+#[py_export]
+fn search(expr: str, data: str) -> String {
+    let vals: Vec<Jv> = Vec::new();
+    let n = len(data);
+    let mut err: i64 = 0;
+    // Strict JSON: the document must start with a JSON value and the whole
+    // input must be consumed. Empty/whitespace-only or trailing garbage ->
+    // error 1, matching json.loads' behaviour so search_json() raises.
+    let mut start = 0;
+    ws_skip(data, n, &mut start);
+    let c = data[start];
+    let valid_start = ((c == 123) || (c == 91) || (c == 34) || (c == 116)
+        || (c == 102) || (c == 110) || ((c >= 48) && (c <= 57)) || (c == 45));
+    if (b2i(valid_start) == 0) {
+        err = 1;
+    }
+    // parse the document into the value vals
+    let jpos = start;
+    let root = parse_value(data, n, &mut jpos, &mut vals, &mut err);
+    let mut endpos = jpos;
+    ws_skip(data, n, &mut endpos);
+    if (endpos != n) {
+        err = 1;
+    }
+    // parse the expression into its own AST vals
+    let ast_vals: Vec<Ast> = Vec::new();
+    let root_ast = parse_expr_to_ast(expr, &mut vals, &mut ast_vals, &mut err);
+    if (err != 0) {
+        let mut out = String::new();
+        out.push(30);
+        out.push_str("ERR");
+        out.push_str(int_to_str(err));
+        return out;
+    }
+    let result = eval(root_ast, &ast_vals, &mut vals, root, &mut err);
+    if (err != 0) {
+        let mut out = String::new();
+        out.push(30);
+        out.push_str("ERR");
+        out.push_str(int_to_str(err));
+        return out;
+    }
+    let mut out: Vec<i64> = Vec::new();
+    ser_idx(result, &vals, &mut out);
+    return bytes_to_string(&mut out);
+}
+
+// =====================================================================
+// JSONL streaming layer
+// =====================================================================
+//
+// One JMESPath expression, applied to every line of a JSONL document:
+//   - map    (projection): the expression result is serialized per line,
+//                          null results are skipped
+//   - filter (keep line):  lines whose result is truthy are kept as-is
+//
+// The expression AST is parsed exactly once; each line gets its own fresh
+// value arena seeded with a copy of the expression literal values, so the
+// literal indexes inside the AST stay valid without cross-line pollution.
+
+fn jv_copy(v: Jv) -> Jv {
+    match (v) {
+        Null => { return Jv::Null; }
+        B(x) => { return Jv::B(x); }
+        N(x) => { return Jv::N(x); }
+        S(s) => { return Jv::S(s); }
+        A(items) => {
+            let nv: Vec<i64> = Vec::new();
+            let n = items.len();
+            let i = 0;
+            while (i < n) {
+                nv.push(items.get(i));
+                i = i + 1;
+            }
+            return Jv::A(nv);
+        }
+        O(pairs) => {
+            let nv: Vec<i64> = Vec::new();
+            let n = pairs.len();
+            let i = 0;
+            while (i < n) {
+                nv.push(pairs.get(i));
+                i = i + 1;
+            }
+            return Jv::O(nv);
+        }
+    }
+    return Jv::Null;
+}
+
+// Copy the expression literal values (indices 0..nlit) into a fresh arena.
+fn seed_line_vals(expr_vals: &Vec<Jv>, lvals: &mut Vec<Jv>) {
+    let nlit = expr_vals.len();
+    let i = 0;
+    while (i < nlit) {
+        lvals.push(jv_copy(expr_vals.get(i)));
+        i = i + 1;
+    }
+}
+
+// Parse one JSONL line (strict) into lvals, return root index.
+// On any parse error returns -1.
+fn parse_line_json(line: str, ln: i64, lvals: &mut Vec<Jv>) -> i64 {
+    let mut pos: i64 = 0;
+    let mut err: i64 = 0;
+    ws_skip(line, ln, &mut pos);
+    let c = line[pos];
+    let valid_start = ((c == 123) || (c == 91) || (c == 34) || (c == 116)
+        || (c == 102) || (c == 110) || ((c >= 48) && (c <= 57)) || (c == 45));
+    if (b2i(valid_start) == 0) {
+        err = 1;
+    }
+    let root = parse_value(line, ln, &mut pos, lvals, &mut err);
+    let mut endpos = pos;
+    ws_skip(line, ln, &mut endpos);
+    if (endpos != ln) {
+        err = 1;
+    }
+    if (err != 0) {
+        return -1;
+    }
+    return root;
+}
+
+// Apply the pre-parsed expression to one line, append serialized result to
+// `out` (map mode). Returns 1 if a result was produced, 0 if skipped.
+//
+// NOTE on memory: the Aero runtime does not reclaim per-line heap strings
+// inside a single py_export call, so callers must bound the number of lines
+// per call (the Python wrapper chunks at ~10k lines; the arena is reset at
+// every C-extension boundary, so chunking keeps memory flat).
+fn map_line(line: str, ln: i64, root_ast: i64, ast: &Vec<Ast>, expr_vals: &Vec<Jv>, out: &mut Vec<i64>) -> i64 {
+    let mut lvals: Vec<Jv> = Vec::new();
+    seed_line_vals(expr_vals, &mut lvals);
+    let root = parse_line_json(line, ln, &mut lvals);
+    if (root < 0) {
+        return 0;
+    }
+    let mut err: i64 = 0;
+    let result = eval(root_ast, ast, &mut lvals, root, &mut err);
+    if (err != 0) {
+        return 0;
+    }
+    if (b2i(is_null(result, &mut lvals)) == 1) {
+        return 0;
+    }
+    ser_idx(result, &lvals, out);
+    return 1;
+}
+
+// Apply the expression to one line and report whether the result is truthy
+// (filter mode). Returns -1 on error, 0 falsy, 1 truthy.
+fn filter_line(line: str, ln: i64, root_ast: i64, ast: &Vec<Ast>, expr_vals: &Vec<Jv>) -> i64 {
+    let mut lvals: Vec<Jv> = Vec::new();
+    seed_line_vals(expr_vals, &mut lvals);
+    let root = parse_line_json(line, ln, &mut lvals);
+    if (root < 0) {
+        return -1;
+    }
+    let mut err: i64 = 0;
+    let result = eval(root_ast, ast, &mut lvals, root, &mut err);
+    if (err != 0) {
+        return -1;
+    }
+    if (truthy(result, &mut lvals)) {
+        return 1;
+    }
+    return 0;
+}
+
+// Batch-map a whole JSONL document string (already in memory). The expression
+// is parsed once; each line is projected through it. Returns the concatenated
+// output ("" on expression error, or when no line matched).
+#[py_export]
+fn map_jsonl(expr: str, data: str) -> String {
+    let mut vals: Vec<Jv> = Vec::new();
+    let mut ast: Vec<Ast> = Vec::new();
+    let mut err: i64 = 0;
+    let root_ast = parse_expr_to_ast(expr, &mut vals, &mut ast, &mut err);
+    if (err != 0) {
+        let mut o = String::new();
+        o.push(30);
+        o.push_str("ERR1");
+        return o;
+    }
+    let mut out: Vec<i64> = Vec::new();
+    let n = len(data);
+    let mut pos: i64 = 0;
+    let mut count: i64 = 0;
+    while (pos < n) {
+        let line_start = pos;
+        while ((pos < n) && (data[pos] != 10)) {
+            pos = pos + 1;
+        }
+        // line is data[line_start .. pos], strip trailing \r
+        let mut ln = pos - line_start;
+        if ((ln > 0) && (data[line_start + ln - 1] == 13)) {
+            ln = ln - 1;
+        }
+        // skip blank lines
+        let mut bl = 1;
+        let mut bi = 0;
+        while (bi < ln) {
+            let cc = data[line_start + bi];
+            if ((cc != 32) && (cc != 9) && (cc != 10) && (cc != 13)) {
+                bl = 0;
+            }
+            bi = bi + 1;
+        }
+        if (bl == 0) {
+            // build a NUL-terminated view of this line (fresh String)
+            let lsb = String::new();
+            let li = 0;
+            while (li < ln) {
+                lsb.push(data[line_start + li]);
+                li = li + 1;
+            }
+            let line = lsb.data();
+            if (map_line(line, ln, root_ast, &ast, &vals, &mut out) == 1) {
+                out.push(10); // newline
+                count = count + 1;
+            }
+        }
+        pos = pos + 1; // skip newline
+    }
+    return bytes_to_string(&mut out);
+}
+
+// Batch-filter a JSONL document string: keeps lines whose expression result
+// is truthy. Returns the original lines that matched.
+#[py_export]
+fn filter_jsonl(expr: str, data: str) -> String {
+    let mut vals: Vec<Jv> = Vec::new();
+    let mut ast: Vec<Ast> = Vec::new();
+    let mut err: i64 = 0;
+    let root_ast = parse_expr_to_ast(expr, &mut vals, &mut ast, &mut err);
+    if (err != 0) {
+        let mut o = String::new();
+        o.push(30);
+        o.push_str("ERR1");
+        return o;
+    }
+    let mut out: Vec<i64> = Vec::new();
+    let n = len(data);
+    let mut pos: i64 = 0;
+    while (pos < n) {
+        let line_start = pos;
+        while ((pos < n) && (data[pos] != 10)) {
+            pos = pos + 1;
+        }
+        let mut ln = pos - line_start;
+        if ((ln > 0) && (data[line_start + ln - 1] == 13)) {
+            ln = ln - 1;
+        }
+        let mut bl = 1;
+        let mut bi = 0;
+        while (bi < ln) {
+            let cc = data[line_start + bi];
+            if ((cc != 32) && (cc != 9) && (cc != 10) && (cc != 13)) {
+                bl = 0;
+            }
+            bi = bi + 1;
+        }
+        if (bl == 0) {
+            let lsb = String::new();
+            let li = 0;
+            while (li < ln) {
+                lsb.push(data[line_start + li]);
+                li = li + 1;
+            }
+            let line = lsb.data();
+            if (filter_line(line, ln, root_ast, &ast, &vals) == 1) {
+                // emit the original line (with \r\n preserved via out)
+                let ei = 0;
+                while (ei < ln) {
+                    out.push(line[ei]);
+                    ei = ei + 1;
+                }
+                out.push(10);
+            }
+        }
+        pos = pos + 1;
+    }
+    return bytes_to_string(&mut out);
+}
+
+// Per-line truthy check for streaming (Python iterates lines, keeps memory
+// flat). Returns 1 truthy / 0 falsy / -1 error.
+#[py_export]
+fn line_truthy(expr: str, data: str) -> i64 {
+    let mut vals: Vec<Jv> = Vec::new();
+    let mut ast: Vec<Ast> = Vec::new();
+    let mut err: i64 = 0;
+    let root_ast = parse_expr_to_ast(expr, &mut vals, &mut ast, &mut err);
+    if (err != 0) {
+        return -1;
+    }
+    let n = len(data);
+    let mut lvals: Vec<Jv> = Vec::new();
+    seed_line_vals(&vals, &mut lvals);
+    let root = parse_line_json(data, n, &mut lvals);
+    if (root < 0) {
+        return -1;
+    }
+    let result = eval(root_ast, &ast, &mut lvals, root, &mut err);
+    if (err != 0) {
+        return -1;
+    }
+    if (truthy(result, &mut lvals)) {
+        return 1;
+    }
+    return 0;
+}
+
