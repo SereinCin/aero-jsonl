@@ -13,10 +13,12 @@ runs entirely in native code. Usage modes:
   an in-memory JSONL string (bounded to a few thousand lines per call).
 """
 from .kernel import search, map_jsonl, filter_jsonl, line_truthy
+from .query import extract, where
 
 __all__ = [
     "search", "map_jsonl", "filter_jsonl", "line_truthy",
     "map_file", "filter_file", "map_lines", "filter_lines",
+    "where", "extract",
 ]
 __version__ = "0.1.0"
 

@@ -13,6 +13,12 @@ import aero_jsonl
 
 aero_jsonl.filter_file("status == `active`", "app.log.jsonl", "active.jsonl")
 aero_jsonl.map_file("messages[1].tool_calls[0].name", "sessions.jsonl", "tools.txt")
+
+# Object-level query helpers over any jsonl.load source (file/URL/compressed...).
+for server in aero_jsonl.where("status == `active`", "servers.jsonl"):
+    print(server["name"])
+for tool in aero_jsonl.extract("messages[1].tool_calls[0].name", "sessions.jsonl.gz"):
+    print(tool)
 ```
 
 ```bash
@@ -49,10 +55,18 @@ and forces you to reach for a heavy dataframe engine or a full database just to
 | `map_lines(expr, iterable)` | line | Same as `map_file` over an iterable, one native call per line |
 | `filter_lines(expr, iterable)` | line | Same as `filter_file` over an iterable |
 | `map_jsonl(expr, data)` / `filter_jsonl(expr, data)` | batch | Operate on an in-memory JSONL string (bounded per call) |
+| `where(expr, source)` | object | Keep decoded objects whose `expr` result is truthy |
+| `extract(expr, source)` | object | Project `expr` over a source, yielding non-null results |
 
 Semantics: `map` serializes the expression result per line (null → line
 dropped); `filter` keeps the original line when the result is truthy. Both are
 the same JMESPath evaluator that passes all 578 official compliance tests.
+
+The object-level helpers `where` / `extract` accept any source understood by
+[`jsonl`](https://github.com/rmoralespp/jsonl)'s `load` (file, URL, compressed,
+file-like). `aero-jsonl` depends on `jsonl` underneath and uses it as the JSONL
+I/O/streaming layer — so the query API lives here while `jsonl` itself stays a
+zero-dependency library.
 
 ## Command line
 
@@ -75,7 +89,8 @@ cp src/kernel.pyd aero_jsonl/           # package the extension
 ## Tests
 
 ```
-python tests/test_jsonl.py     # 16 map/filter/error tests
+python tests/test_jsonl.py     # 16 kernel map/filter/error tests
+python tests/test_query.py     # 10 where/extract object query tests
 ```
 
 ## Benchmark & honest positioning

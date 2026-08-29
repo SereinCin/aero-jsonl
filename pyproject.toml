@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Native JSONL / JSON Lines processing for Python (Aero-compiled kernel)"
 readme = "README.md"
 requires-python = ">=3.8"
+dependencies = ["jsonl"]
 license = { text = "MIT" }
 keywords = ["jsonl", "ndjson", "json", "jmespath", "streaming", "fast"]
 classifiers = [
